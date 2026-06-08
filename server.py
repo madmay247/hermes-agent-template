@@ -44,6 +44,8 @@ from starlette.responses import (
     Response,
 )
 from starlette.routing import Route, WebSocketRoute
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.templating import Jinja2Templates
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
@@ -621,6 +623,38 @@ def _load_desktop_remote_token() -> str:
 
 DESKTOP_REMOTE_TOKEN = _load_desktop_remote_token()
 
+# Unauthenticated discovery: the desktop app probes the backend BEFORE it has a
+# token, to detect reachability + which auth method to show. These mirror the
+# native dashboard's own public, secret-free endpoints so that probe succeeds
+# through the wrapper. (reveal / config-write / chat stay gated.)
+_DESKTOP_PUBLIC_PATHS = frozenset({
+    "/api/status",
+    "/api/config/defaults",
+    "/api/config/schema",
+    "/api/model/info",
+    "/api/dashboard/themes",
+    "/api/dashboard/plugins",
+})
+
+# Temporary: log unauthenticated /api probes (method, path, origin) to the volume
+# so the exact desktop discovery call can be confirmed. Safe to remove later.
+_PROBE_LOG = Path(HERMES_HOME) / "desktop-probe.log"
+
+
+def _log_probe(request) -> None:
+    try:
+        p = request.url.path
+        if not (p == "/" or p.startswith("/api/")):
+            return
+        origin = request.headers.get("origin", "-")
+        if _PROBE_LOG.exists() and _PROBE_LOG.stat().st_size > 200_000:
+            _PROBE_LOG.unlink()
+        with _PROBE_LOG.open("a") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {request.method} {p} origin={origin}\n")
+    except Exception:
+        pass
+
+
 # The native dashboard injects its ephemeral session token into the SPA HTML as
 # `window.__HERMES_SESSION_TOKEN__`. It rotates whenever the dashboard subprocess
 # restarts, so we scrape + cache it lazily and refresh on upstream auth failure.
@@ -687,6 +721,11 @@ def guard(request: Request) -> Response | None:
     - API / XHR: 401 JSON (so the SPA's fetch() can surface it cleanly)
     """
     if _is_authenticated(request) or _has_desktop_token(request):
+        return None
+    _log_probe(request)
+    # Let the desktop's pre-auth discovery probe reach the dashboard's own
+    # public, secret-free endpoints so the app can detect the gateway + auth.
+    if request.method in ("GET", "HEAD") and request.url.path in _DESKTOP_PUBLIC_PATHS:
         return None
     accept = request.headers.get("accept", "").lower()
     wants_html = "text/html" in accept
@@ -1539,7 +1578,25 @@ routes = [
 
 # No middleware — auth is enforced per-handler via guard(). This keeps /health
 # and /login truly unauthenticated without middleware gymnastics.
-app = Starlette(routes=routes, lifespan=lifespan)
+# CORS: the desktop app is an Electron client whose fetch()/WebSocket calls come
+# from a non-web origin (e.g. file://). Without permissive CORS + OPTIONS
+# preflight handling its requests fail as opaque network errors ("could not
+# reach this gateway"). Reflect any origin and allow the token headers; actual
+# authorization is still enforced by guard()/ws_proxy, not by CORS.
+app = Starlette(
+    routes=routes,
+    lifespan=lifespan,
+    middleware=[
+        Middleware(
+            CORSMiddleware,
+            allow_origin_regex=".*",
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["*"],
+        ),
+    ],
+)
 
 if __name__ == "__main__":
     import uvicorn

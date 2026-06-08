@@ -561,7 +561,12 @@ def unmask(new: dict[str, str], existing: dict[str, str]) -> dict[str, str]:
 # change via Railway → redeploy → all existing cookies invalidate → users re-login.
 import hashlib as _hashlib
 import hmac as _hmac
-from urllib.parse import quote as _url_quote, urlparse as _urlparse
+from urllib.parse import (
+    quote as _url_quote,
+    urlparse as _urlparse,
+    parse_qsl as _parse_qsl,
+    urlencode as _urlencode,
+)
 
 COOKIE_NAME = "hermes_auth"
 COOKIE_MAX_AGE = 7 * 86400  # 7 days
@@ -593,6 +598,77 @@ def _is_authenticated(request: Request) -> bool:
     return _verify_auth_token(request.cookies.get(COOKIE_NAME, ""))
 
 
+# ── Desktop "Remote gateway" token auth ───────────────────────────────────────
+# The packaged Hermes desktop app connects with a fixed session token instead of
+# the browser admin-login cookie: it presents the token as `?token=` on the
+# /api/ws* WebSocket upgrade and as `X-Hermes-Session-Token` / `Authorization:
+# Bearer` on HTTP /api/* calls. We accept that token at the edge (in addition to
+# the cookie) and, before forwarding upstream, swap it for the dashboard's own
+# ephemeral session token so the native dashboard (loopback :9119) accepts it.
+#
+# The token is read from $HERMES_DESKTOP_REMOTE_TOKEN, falling back to the same
+# key in the volume-persisted .env so it survives redeploys without a Railway
+# variable. Empty ⇒ feature disabled (cookie-only, exactly as before).
+def _load_desktop_remote_token() -> str:
+    tok = os.environ.get("HERMES_DESKTOP_REMOTE_TOKEN", "").strip()
+    if tok:
+        return tok
+    try:
+        return read_env(ENV_FILE).get("HERMES_DESKTOP_REMOTE_TOKEN", "").strip()
+    except Exception:
+        return ""
+
+
+DESKTOP_REMOTE_TOKEN = _load_desktop_remote_token()
+
+# The native dashboard injects its ephemeral session token into the SPA HTML as
+# `window.__HERMES_SESSION_TOKEN__`. It rotates whenever the dashboard subprocess
+# restarts, so we scrape + cache it lazily and refresh on upstream auth failure.
+_upstream_token: dict = {"value": None}
+_UPSTREAM_TOKEN_RE = re.compile(r'window\.__HERMES_SESSION_TOKEN__="([^"]+)"')
+
+
+async def _get_upstream_token(force: bool = False):
+    """Return the dashboard's current session token, scraped from its loopback
+    SPA HTML (root `/` is served without auth). Cached; force=True refetches."""
+    if not force and _upstream_token["value"]:
+        return _upstream_token["value"]
+    try:
+        resp = await get_http_client().get(f"{HERMES_DASHBOARD_URL}/")
+        m = _UPSTREAM_TOKEN_RE.search(resp.text)
+        if m:
+            _upstream_token["value"] = m.group(1)
+            return _upstream_token["value"]
+    except Exception as e:
+        print(f"[desktop-auth] could not read upstream session token: {e!r}", flush=True)
+    return None
+
+
+def _presented_token(conn) -> str:
+    """Token the desktop app presented — HTTP header or WS `?token=` query."""
+    hdr = conn.headers.get("x-hermes-session-token", "")
+    if hdr:
+        return hdr.strip()
+    auth = conn.headers.get("authorization", "")
+    if auth[:7].lower() == "bearer ":
+        return auth[7:].strip()
+    try:
+        return (conn.query_params.get("token") or "").strip()
+    except Exception:
+        return ""
+
+
+def _has_desktop_token(conn) -> bool:
+    """True when the caller authenticated with the configured desktop token.
+    Accepts a Starlette Request or WebSocket (both are HTTPConnection)."""
+    if not DESKTOP_REMOTE_TOKEN:
+        return False
+    presented = _presented_token(conn)
+    return bool(presented) and _hmac.compare_digest(
+        presented.encode(), DESKTOP_REMOTE_TOKEN.encode()
+    )
+
+
 def _safe_return_to(value: str) -> str:
     """Reject open-redirect attempts — only allow same-origin relative paths."""
     if not value or not value.startswith("/") or value.startswith("//"):
@@ -610,7 +686,7 @@ def guard(request: Request) -> Response | None:
     - HTML navigation: 302 to /login?returnTo=<path>
     - API / XHR: 401 JSON (so the SPA's fetch() can surface it cleanly)
     """
-    if _is_authenticated(request):
+    if _is_authenticated(request) or _has_desktop_token(request):
         return None
     accept = request.headers.get("accept", "").lower()
     wants_html = "text/html" in accept
@@ -1127,6 +1203,15 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     }
     body = await request.body()
 
+    # If the caller authenticated with the desktop remote token, replace it with
+    # the dashboard's real ephemeral session token before forwarding upstream.
+    via_desktop = _has_desktop_token(request)
+    if via_desktop:
+        up = await _get_upstream_token()
+        if up:
+            req_headers.pop("authorization", None)
+            req_headers["x-hermes-session-token"] = up
+
     try:
         upstream = await client.request(
             request.method,
@@ -1134,6 +1219,14 @@ async def _proxy_to_dashboard(request: Request) -> Response:
             headers=req_headers,
             content=body,
         )
+        # Upstream token may have rotated (dashboard restart) — refresh once.
+        if via_desktop and upstream.status_code == 401:
+            up = await _get_upstream_token(force=True)
+            if up:
+                req_headers["x-hermes-session-token"] = up
+                upstream = await client.request(
+                    request.method, target, headers=req_headers, content=body,
+                )
     except (httpx.ConnectError, httpx.ConnectTimeout):
         return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=503)
     except httpx.RequestError as e:
@@ -1314,36 +1407,54 @@ async def ws_proxy(websocket: WebSocket) -> None:
       5. When either direction ends (client navigates away, upstream PTY
          exits, etc.), cancel the other task and close both sockets
     """
-    # 1. Edge auth.
-    if not _is_authenticated(websocket):
+    # 1. Edge auth: admin cookie (browser SPA) OR the desktop remote token.
+    via_desktop = _has_desktop_token(websocket)
+    if not (_is_authenticated(websocket) or via_desktop):
         # Close before accept — browser sees the handshake fail (expected
         # for unauthenticated calls).
         await websocket.close(code=4401)
         return
 
     # 2. Build upstream URL preserving the SPA's path + query (the query
-    #    contains the hermes session token + channel id).
+    #    contains the hermes session token + channel id). For desktop-token
+    #    callers we substitute the dashboard's real ephemeral session token.
     path = websocket.url.path
-    qs = websocket.url.query
-    upstream_url = f"ws://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}{path}"
-    if qs:
-        upstream_url = f"{upstream_url}?{qs}"
+
+    async def _build_upstream_url(force_token: bool = False) -> str:
+        params = dict(_parse_qsl(websocket.url.query, keep_blank_values=True))
+        if via_desktop:
+            up = await _get_upstream_token(force=force_token)
+            if up:
+                params["token"] = up
+        base = f"ws://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}{path}"
+        return f"{base}?{_urlencode(params)}" if params else base
 
     try:
         upstream = await websockets.connect(
-            upstream_url,
+            await _build_upstream_url(),
             open_timeout=5,
             # Don't forward client cookies/headers — hermes WS auth is
             # purely token-based via the URL, and forwarding random
             # headers risks future upstream surprises.
         )
     except (asyncio.TimeoutError, OSError, websockets.exceptions.WebSocketException) as e:
-        # Hermes dashboard down, restarting, or rejected the upgrade
-        # (e.g. bad/missing session token).
-        print(f"[ws-proxy] upstream connect failed for {path}: {e!r}", flush=True)
-        # 1011 = internal error; client SPA will surface a generic close.
-        await websocket.close(code=1011)
-        return
+        # Hermes dashboard down, restarting, or rejected the upgrade (e.g. bad/
+        # missing token). For desktop callers the upstream token may have just
+        # rotated — refetch it and retry once before giving up.
+        if via_desktop:
+            try:
+                upstream = await websockets.connect(
+                    await _build_upstream_url(force_token=True), open_timeout=5,
+                )
+            except (asyncio.TimeoutError, OSError, websockets.exceptions.WebSocketException) as e2:
+                print(f"[ws-proxy] upstream connect failed for {path}: {e2!r}", flush=True)
+                await websocket.close(code=1011)
+                return
+        else:
+            print(f"[ws-proxy] upstream connect failed for {path}: {e!r}", flush=True)
+            # 1011 = internal error; client SPA will surface a generic close.
+            await websocket.close(code=1011)
+            return
 
     # 3. Both sides ready — accept and start pumping.
     await websocket.accept()
